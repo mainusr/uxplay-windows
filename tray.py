@@ -1,182 +1,293 @@
+# tray.py
+# UxPlay Windows tray controller with toggles for:
+#  - Borderless window (hide title bar / chrome)
+#  - Always on top (pin)
+#
+# Tailored to find the UxPlay window titled "Direct3D11 renderer"
+#
+# Dependencies: pywin32, pystray, pillow, (optional) psutil
+# Install (for local testing): pip install pywin32 pystray pillow psutil
+
+from pathlib import Path
 import threading
 import time
 import json
 import os
-from pathlib import Path
+import sys
+import traceback
 
-import win32gui
-import win32con
-import win32api
+# optional robust process scanning
+try:
+    import psutil
+except Exception:
+    psutil = None
 
-import pystray
-from pystray import Menu, MenuItem
-from PIL import Image, ImageDraw
+# win32
+try:
+    import win32gui
+    import win32con
+    import win32api
+    import win32process
+except Exception as e:
+    print("Missing pywin32. Install with: pip install pywin32")
+    raise
 
+# tray
+try:
+    import pystray
+    from pystray import MenuItem, Menu
+    from PIL import Image, ImageDraw
+except Exception as e:
+    print("Missing pystray / pillow. Install with: pip install pystray pillow")
+    raise
 
-# --------------------------------------------------------
-# Persistent config file (stored next to the .exe)
-# --------------------------------------------------------
+# -----------------------
+# Configuration / state
+# -----------------------
+HERE = Path(__file__).resolve().parent
+CONFIG_FILE = HERE / "tray_config.json"
 
-CONFIG_PATH = Path(__file__).with_name("tray_config.json")
-
-DEFAULT_CONFIG = {
+DEFAULT_CFG = {
     "borderless": False,
-    "always_on_top": False
+    "always_on_top": False,
+    # The exact window title (or you can add more substrings)
+    "title_substrings": ["Direct3D11 renderer"]
 }
 
-
 def load_config():
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text())
-        except:
-            return DEFAULT_CONFIG.copy()
-    return DEFAULT_CONFIG.copy()
-
+    try:
+        if CONFIG_FILE.exists():
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        traceback.print_exc()
+    # ensure defaults
+    cfg = DEFAULT_CFG.copy()
+    save_config(cfg)
+    return cfg
 
 def save_config(cfg):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    try:
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        traceback.print_exc()
 
+cfg = load_config()
 
-config = load_config()
-
-
-# --------------------------------------------------------
-# Window search utilities
-# --------------------------------------------------------
-
-def find_uxplay_window():
-    """Find the UxPlay window by searching all top-level windows."""
-    target_substrings = ["uxplay", "airplay", "receiver"]
-
+# -----------------------
+# Window detection
+# -----------------------
+def enum_visible_windows():
+    """Return list of (hwnd, title) for visible top-level windows."""
     result = []
-
-    def callback(hwnd, _):
+    def cb(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
-            title = win32gui.GetWindowText(hwnd).lower()
-            if any(sub in title for sub in target_substrings):
-                result.append(hwnd)
+            title = win32gui.GetWindowText(hwnd)
+            if title:
+                result.append((hwnd, title))
         return True
+    win32gui.EnumWindows(cb, None)
+    return result
 
-    win32gui.EnumWindows(callback, None)
+def find_uxplay_windows():
+    """
+    Find windows whose title contains any of the configured substrings.
+    Returns list of hwnds.
+    """
+    substrs = [s.lower() for s in cfg.get("title_substrings", []) if s]
+    matches = []
 
-    return result[0] if result else None
+    for hwnd, title in enum_visible_windows():
+        tl = title.lower()
+        if any(sub in tl for sub in substrs):
+            matches.append(hwnd)
 
+    # fallback: try finding windows by process name (uxplay.exe) if psutil is available
+    if not matches and psutil:
+        try:
+            for proc in psutil.process_iter(['pid', 'name']):
+                name = (proc.info.get('name') or '').lower()
+                if name in ("uxplay.exe", "uxplay"):
+                    pid = proc.info['pid']
+                    def cb(hwnd, acc):
+                        _, wnd_pid = win32process.GetWindowThreadProcessId(hwnd)
+                        if wnd_pid == pid and win32gui.IsWindowVisible(hwnd):
+                            acc.append(hwnd)
+                        return True
+                    acc = []
+                    win32gui.EnumWindows(cb, acc)
+                    for h in acc:
+                        # ensure it has a title
+                        if win32gui.GetWindowText(h):
+                            matches.append(h)
+        except Exception:
+            traceback.print_exc()
 
-# --------------------------------------------------------
-# Window style manipulation
-# --------------------------------------------------------
+    # dedupe and return
+    return list(dict.fromkeys(matches))
 
-original_styles = {}
+# -----------------------
+# Style manipulation
+# -----------------------
+# store original styles per-hwnd so we can restore
+_original_styles = {}
 
+def _get_style(hwnd):
+    # use GetWindowLongPtr on 64-bit, fallback to GetWindowLong
+    try:
+        return win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+    except Exception:
+        try:
+            return win32api.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        except Exception:
+            return None
 
-def apply_borderless(hwnd):
-    style = win32api.GetWindowLong(hwnd, win32con.GWL_STYLE)
-    original_styles[hwnd] = style
-    new_style = style & ~(
-        win32con.WS_CAPTION |
-        win32con.WS_THICKFRAME |
-        win32con.WS_MINIMIZEBOX |
-        win32con.WS_MAXIMIZEBOX |
-        win32con.WS_SYSMENU
-    )
-    win32api.SetWindowLong(hwnd, win32con.GWL_STYLE, new_style)
-    win32gui.SetWindowPos(
-        hwnd, None, 0, 0, 0, 0,
-        win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
-        win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED
-    )
+def _set_style(hwnd, style):
+    # try to set using win32api/win32gui; both map to appropriate calls in pywin32
+    try:
+        win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
+    except Exception:
+        try:
+            win32api.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
+        except Exception:
+            raise
 
+    # Force the window to update its non-client area
+    try:
+        win32gui.SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
+                              win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED)
+    except Exception:
+        pass
 
-def remove_borderless(hwnd):
-    if hwnd in original_styles:
-        win32api.SetWindowLong(hwnd, win32con.GWL_STYLE, original_styles[hwnd])
+def make_borderless(hwnd):
+    try:
+        style = _get_style(hwnd)
+        if style is None:
+            return
+        if hwnd not in _original_styles:
+            _original_styles[hwnd] = style
+        new_style = style & ~(win32con.WS_CAPTION | win32con.WS_THICKFRAME |
+                              win32con.WS_MINIMIZEBOX | win32con.WS_MAXIMIZEBOX |
+                              win32con.WS_SYSMENU)
+        _set_style(hwnd, new_style)
+    except Exception:
+        traceback.print_exc()
+
+def restore_style(hwnd):
+    try:
+        orig = _original_styles.get(hwnd)
+        if orig is not None:
+            _set_style(hwnd, orig)
+            del _original_styles[hwnd]
+    except Exception:
+        traceback.print_exc()
+
+def set_topmost(hwnd, enable=True):
+    try:
         win32gui.SetWindowPos(
-            hwnd, None, 0, 0, 0, 0,
-            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
-            win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED
+            hwnd,
+            win32con.HWND_TOPMOST if enable else win32con.HWND_NOTOPMOST,
+            0, 0, 0, 0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
         )
+    except Exception:
+        traceback.print_exc()
 
+# -----------------------
+# Re-apply loop
+# -----------------------
+_stop_event = threading.Event()
+_REAPPLY_INTERVAL = 1.5
 
-def apply_topmost(hwnd, enable):
-    win32gui.SetWindowPos(
-        hwnd,
-        win32con.HWND_TOPMOST if enable else win32con.HWND_NOTOPMOST,
-        0, 0, 0, 0,
-        win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
-    )
-
-
-# --------------------------------------------------------
-# Reapply loop (handles window recreation)
-# --------------------------------------------------------
-
-stop_event = threading.Event()
-
+def apply_settings_once():
+    hwnds = find_uxplay_windows()
+    if not hwnds:
+        return
+    for h in hwnds:
+        try:
+            if cfg.get("borderless"):
+                make_borderless(h)
+            else:
+                restore_style(h)
+            set_topmost(h, cfg.get("always_on_top", False))
+        except Exception:
+            traceback.print_exc()
 
 def reapply_loop():
-    while not stop_event.is_set():
-        hwnd = find_uxplay_window()
-        if hwnd:
-            if config["borderless"]:
-                apply_borderless(hwnd)
-            else:
-                remove_borderless(hwnd)
+    # run continuously to ensure settings apply after window recreation
+    while not _stop_event.is_set():
+        try:
+            apply_settings_once()
+        except Exception:
+            traceback.print_exc()
+        _stop_event.wait(_REAPPLY_INTERVAL)
 
-            apply_topmost(hwnd, config["always_on_top"])
-
-        time.sleep(1.5)
-
-
-# --------------------------------------------------------
-# Tray icon + menu
-# --------------------------------------------------------
-
-def icon_image():
-    img = Image.new("RGB", (64, 64), (0, 100, 255))
+# -----------------------
+# Tray UI
+# -----------------------
+def _create_image():
+    # simple icon (rounded square + play symbol)
+    size = (64, 64)
+    img = Image.new("RGBA", size, (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rectangle((18, 22, 46, 42), fill=(255, 255, 255))
+    d.rounded_rectangle((6, 6, 58, 58), 10, fill=(20, 120, 200, 255))
+    d.polygon([(26, 20), (26, 44), (46, 32)], fill=(255, 255, 255, 255))
     return img
 
-
-def toggle_borderless(icon, item):
-    config["borderless"] = not config["borderless"]
-    save_config(config)
+def on_toggle_borderless(icon, item):
+    cfg["borderless"] = not cfg.get("borderless", False)
+    save_config(cfg)
+    apply_settings_once()
     icon.update_menu()
 
-
-def toggle_topmost(icon, item):
-    config["always_on_top"] = not config["always_on_top"]
-    save_config(config)
+def on_toggle_topmost(icon, item):
+    cfg["always_on_top"] = not cfg.get("always_on_top", False)
+    save_config(cfg)
+    apply_settings_once()
     icon.update_menu()
 
+def on_reapply_now(icon, item):
+    apply_settings_once()
 
-def quit_app(icon, item):
-    stop_event.set()
+def on_quit(icon, item):
+    _stop_event.set()
+    try:
+        icon.visible = False
+    except Exception:
+        pass
     icon.stop()
 
-
-def start_tray():
-    menu = Menu(
+def build_menu():
+    return (
         MenuItem(
-            "Borderless Window",
-            toggle_borderless,
-            checked=lambda item: config["borderless"]
+            "Borderless window (hide title bar)",
+            on_toggle_borderless,
+            checked=lambda item: cfg.get("borderless", False)
         ),
         MenuItem(
             "Always on Top",
-            toggle_topmost,
-            checked=lambda item: config["always_on_top"]
+            on_toggle_topmost,
+            checked=lambda item: cfg.get("always_on_top", False)
         ),
-        MenuItem("Quit", quit_app)
+        MenuItem.SEPARATOR,
+        MenuItem("Reapply now", on_reapply_now),
+        MenuItem("Quit", on_quit)
     )
 
-    icon = pystray.Icon("UxPlay", icon_image(), "UxPlay", menu)
+def start_tray():
+    icon = pystray.Icon("uxplay", _create_image(), "UxPlay", Menu(*build_menu()))
+    # start reapply thread
+    t = threading.Thread(target=reapply_loop, daemon=True)
+    t.start()
+    try:
+        icon.run()
+    finally:
+        _stop_event.set()
+        t.join(timeout=1.0)
 
-    threading.Thread(target=reapply_loop, daemon=True).start()
-
-    icon.run()
-
-
+# -----------------------
+# CLI / run
+# -----------------------
 if __name__ == "__main__":
+    print("UxPlay tray controller starting. Looking for window title substrings:", cfg.get("title_substrings"))
     start_tray()
